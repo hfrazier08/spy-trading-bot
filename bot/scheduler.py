@@ -710,11 +710,11 @@ def start_scheduler() -> None:
     scheduler.add_job(run_sentiment_weekly_report, trigger=CronTrigger(hour=16, minute=2, day_of_week="fri", timezone=ET),
                       id="sentiment_weekly", max_instances=1)
 
-    # Options flow scan — every 30 min during market hours
+    # Options flow scan — every hour during market hours
     scheduler.add_job(
         lambda: run_flow_scan(["SPY", "QQQ"]) if is_market_open() else None,
-        trigger=IntervalTrigger(minutes=30),
-        id="flow_scan", max_instances=1, coalesce=True, misfire_grace_time=60
+        trigger=IntervalTrigger(hours=1),
+        id="flow_scan", max_instances=1, coalesce=True, misfire_grace_time=120
     )
 
     logger.info(f"Scheduler started — scanning every {CONFIG.scan_interval_minutes} minutes")
