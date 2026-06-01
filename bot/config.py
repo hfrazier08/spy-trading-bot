@@ -59,11 +59,12 @@ class BotConfig:
 
 
 def load_config() -> BotConfig:
-    missing = [k for k in ["DISCORD_WEBHOOK_URL"] if not os.getenv(k)]
-    if missing:
-        raise EnvironmentError(f"Missing required env vars: {missing}")
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
+    if not webhook:
+        import sys
+        print("WARNING: DISCORD_WEBHOOK_URL not set — alerts will be skipped", flush=True)
     return BotConfig(
-        discord_webhook_url=os.environ["DISCORD_WEBHOOK_URL"],
+        discord_webhook_url=webhook,
         twilio_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
         twilio_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
         twilio_from=os.getenv("TWILIO_FROM_WHATSAPP", ""),
