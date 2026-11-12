@@ -379,6 +379,30 @@ def _ensure_spread_levels(t: dict) -> None:
         t["stop_value"] = round(entry * (1 + SPREAD_SL / 100), 2)
 
 
+def apply_manual_reset() -> None:
+    """One-off cleanup: if RESET_OPEN_TRADE='YYYY-MM-DD:<long strike>' matches the open paper trade, close it at
+    the current market value (reason 'manual_reset') and let the strategy re-enter normally. The key must match
+    exactly, so a leftover variable can never close a later trade."""
+    key = os.getenv("RESET_OPEN_TRADE", "").strip()
+    t = _active_paper_trade
+    if not key or t is None:
+        return
+    if key != f"{t.get('entry_date')}:{t['strike']:.0f}":
+        logger.info(f"RESET_OPEN_TRADE={key} does not match the open trade — ignoring")
+        return
+    value = _current_value(t)
+    if value is None:
+        value = t["entry_price"]
+        logger.warning("Manual reset: no live price available, closing at entry price")
+    closed = _close_paper_trade(value, "manual_reset")
+    send_discord_alert({"username": f"{closed['ticker']} Options Bot", "content": (
+        f"🔁 **Paper trade reset** — {_label(closed)} closed at **${value:.2f}** "
+        f"(paid ${closed['entry_price']:.2f}; {'+' if closed['pnl'] >= 0 else '−'}${abs(closed['pnl']):,.0f}).\n"
+        f"It was opened at the 9:35 AM open with an out-of-the-money long strike, which isn't the tested setup. "
+        f"The bot will open a fresh spread after 10:00 AM ET on the next trading day when the trend rule allows.")})
+    logger.info("Manual reset applied")
+
+
 def _spread_status_update(trade: dict, value: float, pct_change: float) -> None:
     """Hourly status, plus one immediate heads-up when the spread gets close to the target or to the stop."""
     global _monitor_ticks
@@ -1143,6 +1167,7 @@ def run_daily_money_report() -> None:
 def start_scheduler() -> None:
     init_db()
     _restore_active_trade()
+    apply_manual_reset()
     scheduler = BlockingScheduler(timezone=ET)
 
     scheduler.add_job(run_scan_cycle, trigger=IntervalTrigger(minutes=CONFIG.scan_interval_minutes),
