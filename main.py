@@ -13,17 +13,11 @@ import sys
 
 from bot.config import CONFIG
 from bot.trade_logger import get_win_rate_summary, init_db
+from bot import logger as log
 
 
 def setup_logging() -> None:
-    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    fmt = "%(asctime)s [%(levelname)-8s] %(name)s — %(message)s"
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("spy_bot.log", encoding="utf-8"),
-    ]
-    logging.basicConfig(level=level, format=fmt, handlers=handlers)
-    # Quiet noisy third-party loggers
+    # Quiet noisy third-party loggers; bot modules use bot.logger directly
     logging.getLogger("yfinance").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
@@ -62,10 +56,18 @@ if __name__ == "__main__":
             print(f"  {k:<20}: {v}")
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "analyze":
+        from bot.analytics import breakdown
+        from bot.scheduler import _load_paper_trades
+        print(breakdown(_load_paper_trades()) or "No closed trades yet.")
+        sys.exit(0)
+
     print_banner()
+    log.main.info("SPY bot starting — logs in qqq_trading_bot/logs/")
 
     from bot.scheduler import start_scheduler
     try:
         start_scheduler()
     except (KeyboardInterrupt, SystemExit):
+        log.main.info("Bot stopped.")
         print("\nBot stopped.")

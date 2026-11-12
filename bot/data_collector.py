@@ -77,9 +77,7 @@ def fetch_market_snapshot() -> MarketSnapshot:
 
 
 def _fetch_live_price(ticker: yf.Ticker, fallback_df: pd.DataFrame) -> float:
-    """Prefer a live/last quote over the (possibly several-minutes-delayed)
-    daily bar close. fast_info pulls a near-real-time last price; the daily
-    bar is only used if that lookup fails entirely."""
+    """Prefer a live/last quote over the daily bar close; fall back to the bar if the lookup fails."""
     try:
         last = ticker.fast_info.get("lastPrice")
         if last:
@@ -128,8 +126,16 @@ def _fetch_sector_etfs() -> Dict[str, pd.DataFrame]:
                 df.index = df.index.tz_convert("America/New_York").tz_localize(None)
             result[t] = df
         except (KeyError, TypeError):
-            logger.warning(f"No data for {t}")
             result[t] = pd.DataFrame()
+        if result[t].empty:
+            # bulk download occasionally returns nothing for some tickers; retry one by one
+            try:
+                df = _normalize_df(yf.Ticker(t).history(period="1y", interval="1d"))
+                result[t] = df.dropna() if not df.empty else df
+            except Exception:
+                pass
+            if result[t].empty:
+                logger.warning(f"No data for {t}")
     return result
 
 
