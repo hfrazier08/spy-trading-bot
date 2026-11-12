@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
 from pathlib import Path
 from typing import Optional
 
@@ -19,13 +19,14 @@ from bot.options_analyzer import analyze_options
 from bot.macro_analyzer import analyze_macro
 from bot.signal_generator import generate_signal, reset_cooldown, HOLD, EXIT_LONG, EXIT_SHORT
 from bot.trade_constructor import construct_trade
-from bot.alert_formatter import format_discord_embed, format_whatsapp_message, format_spread_embed
+from bot.alert_formatter import (format_discord_embed, format_whatsapp_message, format_spread_embed,
+                                 format_spread_update, format_spread_exit)
 from bot.alert_sender import send_all_alerts, send_discord_alert
 from bot.analytics import breakdown
 from bot import health, risk
 from bot.benchmark import benchmark_line
 from bot.fills import log_fill, fills_summary
-from bot.spread_strategy import construct_call_spread, spread_value, spread_quote, TP_PCT as SPREAD_TP, SL_PCT as SPREAD_SL
+from bot.spread_strategy import construct_call_spread, liquid_calls, spread_value, spread_quote, TP_PCT as SPREAD_TP, SL_PCT as SPREAD_SL
 from bot.trade_logger import init_db, log_signal, log_trade_entry, update_trade_exit
 from bot.options_flow import run_sentiment_daily_report, run_sentiment_weekly_report
 
@@ -94,6 +95,9 @@ def _restore_active_trade() -> None:
         with open(ACTIVE_TRADE_FILE) as f:
             _active_paper_trade = json.load(f)
         _current_position = _position_label(_active_paper_trade["direction"])
+        global _monitor_ticks
+        if _is_spread(_active_paper_trade):
+            _monitor_ticks = 11        # first check after a restart sends a fresh status update
         t = _active_paper_trade
         logger.info(f"Restored open paper trade: {t['ticker']} ${t['strike']:.0f} {t['direction']} "
                     f"exp {t['expiration']} entry ${t['entry_price']:.2f}")
@@ -332,6 +336,10 @@ def run_watchdog() -> None:
 # ─────────────────────────────────────────────
 def _exit_alert(kind: str, trade: dict, current: float) -> None:
     ticker = trade["ticker"]
+    if _is_spread(trade):
+        send_discord_alert({"username": f"{ticker} Options Bot",
+                            "content": format_spread_exit(kind, trade, current, trade["pnl"], trade["pnl_pct"])})
+        return
     pnl, pct = trade["pnl"], trade["pnl_pct"]
     held = trade.get("held_days")
     why = {
@@ -361,6 +369,38 @@ def _exit_alert(kind: str, trade: dict, current: float) -> None:
     })
 
 
+def _ensure_spread_levels(t: dict) -> None:
+    """Older open spreads (opened before profit targets existed) get their levels filled in."""
+    entry = t["entry_price"]
+    width = t["short_strike"] - t["strike"]
+    if "tp_value" not in t:
+        t["tp_value"] = round(entry + CONFIG.tp_fraction * (width - entry), 2) if CONFIG.tp_fraction > 0 else 0.0
+    if "stop_value" not in t:
+        t["stop_value"] = round(entry * (1 + SPREAD_SL / 100), 2)
+
+
+def _spread_status_update(trade: dict, value: float, pct_change: float) -> None:
+    """Hourly status, plus one immediate heads-up when the spread gets close to the target or to the stop."""
+    global _monitor_ticks
+    entry, tp = trade["entry_price"], trade["tp_value"]
+    prog = (value - entry) / (tp - entry) if tp > entry else 0.0
+    status = "near" if prog >= 0.75 else "warn" if pct_change <= -30 else "hold"
+    seen = trade.setdefault("milestones", [])
+    first = status != "hold" and status not in seen
+    if first:
+        seen.append(status)
+        _persist_active_trade()
+    _monitor_ticks += 1
+    if not first and _monitor_ticks % 12:          # checks run every 5 min -> status every hour
+        return
+    exp = date.fromisoformat(trade["expiration"])
+    days_left = (exp - datetime.now(ET).date()).days
+    close_by = (exp - timedelta(days=CONFIG.expiry_buffer_days)).strftime("%b %-d")
+    quote = spread_quote(trade["ticker"], trade["expiration"], trade["strike"], trade["short_strike"])
+    send_discord_alert({"username": f"{trade['ticker']} Options Bot", "content": format_spread_update(
+        trade, value, quote, _spot(trade.get("underlying_price", 0.0)), status, days_left, close_by)})
+
+
 def run_position_monitor() -> None:
     global _monitor_ticks
 
@@ -377,6 +417,8 @@ def run_position_monitor() -> None:
         logger.warning("Position monitor: could not fetch a valid current option price")
         return
 
+    if _is_spread(trade):
+        _ensure_spread_levels(trade)
     entry = trade["entry_price"]
     pct_change = ((current_price - entry) / entry) * 100
     contracts = trade["contracts"]
@@ -388,10 +430,16 @@ def run_position_monitor() -> None:
     logger.info(f"Position monitor: {_label(trade)} | entry=${entry:.2f} "
                 f"current=${current_price:.2f} | {pct_change:+.1f}% | P&L ${pnl:+,.2f}")
 
+    if _is_spread(trade):
+        tp_hit = trade["tp_value"] > 0 and current_price >= trade["tp_value"]
+        sl_hit = current_price <= trade["stop_value"]
+    else:
+        tp_hit, sl_hit = pct_change >= tp_pct, pct_change <= sl_pct
+
     reason = None
-    if pct_change >= tp_pct:
+    if tp_hit:
         reason = "take_profit"
-    elif pct_change <= sl_pct:
+    elif sl_hit:
         reason = "stop_loss"
     elif datetime.now(ET).date().isoformat() >= trade["expiration"]:
         reason = "expiration"
@@ -412,6 +460,10 @@ def run_position_monitor() -> None:
     if reason:
         closed = _close_paper_trade(current_price, reason)
         _exit_alert(reason, closed, current_price)
+        return
+
+    if _is_spread(trade):
+        _spread_status_update(trade, current_price, pct_change)
         return
 
     # Regular status update every 6th check (30 min) — checks themselves run every 5 min
@@ -512,14 +564,19 @@ def _scan_spread_strategy(snapshot, technical, macro, options, signal) -> None:
     if not above:
         return
     today = datetime.now(ET).strftime("%Y-%m-%d")
+    hh, mm = (int(x) for x in CONFIG.entry_earliest.split(":"))
+    if datetime.now(ET).time() < dt_time(hh, mm):
+        logger.info(f"Spread strategy: waiting until {CONFIG.entry_earliest} ET so opening quotes can settle")
+        return
     if _last_exit_date() == today:
         logger.info("Spread strategy: already closed a trade today — waiting for tomorrow")
         return
 
     spread = construct_call_spread(
-        options.best_calls, price, snapshot.available_expirations,
+        liquid_calls(snapshot.options_calls), price, snapshot.available_expirations,
         CONFIG.account_size, CONFIG.risk_pct,
         dte_min=CONFIG.spread_dte_min, dte_max=CONFIG.spread_dte_max,
+        tp_fraction=CONFIG.tp_fraction, max_long_otm_pct=CONFIG.max_long_otm_pct,
     )
     if spread is None:
         logger.warning("Spread strategy: no usable spread found — will retry next scan")
@@ -554,9 +611,8 @@ def _scan_spread_strategy(snapshot, technical, macro, options, signal) -> None:
         "ticker": CONFIG.spy, "direction": "call", "strategy": "call_spread_trend",
         "strike": spread.strike, "short_strike": spread.short_strike, "expiration": spread.expiration,
         "entry_price": spread.ask_price, "contracts": spread.contracts, "total_cost": spread.total_cost,
-        "tp_pct": SPREAD_TP, "sl_pct": SPREAD_SL, "time_stop": False,
-        "profit_target": round(spread.ask_price * (1 + SPREAD_TP / 100), 2),
-        "stop_loss_price": round(spread.ask_price * (1 + SPREAD_SL / 100), 2),
+        "tp_value": spread.tp_value, "stop_value": spread.stop_value, "sl_pct": SPREAD_SL, "time_stop": False,
+        "profit_target": spread.tp_value, "stop_loss_price": spread.stop_value,
         "entry_time": signal.timestamp, "entry_date": today, "outcome": "open",
         "vix": snapshot.vix_current, "iv_rank": options.iv_rank, "underlying_price": price,
         "pct_above_200d": round((price / ma200 - 1) * 100, 1), "dte_at_entry": spread.dte,
@@ -743,6 +799,8 @@ def run_trend_update() -> None:
     try:
         snapshot, technical, macro, options, signal = _get_snapshot_and_signal(dry_run=True)
         if CONFIG.strategy == "call_spread_trend":
+            if _active_paper_trade:
+                return        # the hourly position update already covers this
             ma, px = technical.ma_200, snapshot.spy_price
             ok = px > ma
             pos = (f"📂 Open: **{_label(_active_paper_trade)}**" if _active_paper_trade

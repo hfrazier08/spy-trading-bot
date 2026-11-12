@@ -50,12 +50,18 @@ class CallSpread:
     direction: str = "call"
     option_type: str = "Call Spread"
     dte_target: int = 60
+    tp_value: float = 0.0          # close for profit when the spread's price reaches this
+    stop_value: float = 0.0        # close for a loss when it falls to this
+    max_price: float = 0.0         # don't pay more than this net debit
+    long_mid: float = 0.0
+    short_mid: float = 0.0
 
 
 def construct_call_spread(
     calls: pd.DataFrame, spot: float, expirations: list,
     account_size: float, risk_pct: float,
     dte_min: int = 50, dte_max: int = 75, dte_target: int = 60, width_pct: float = 0.04,
+    tp_fraction: float = 0.60, max_long_otm_pct: float = 0.5,
 ) -> Optional[CallSpread]:
     if calls is None or calls.empty or not {"strike", "bid", "ask", "expiration"}.issubset(calls.columns):
         logger.warning("Spread: no call chain available")
@@ -79,6 +85,10 @@ def construct_call_spread(
     if longs.empty:
         return None
     lrow = longs.iloc[0]
+    if float(lrow["strike"]) > spot * (1 + max_long_otm_pct / 100):
+        logger.info(f"Spread: nearest liquid strike ${lrow['strike']:.0f} is more than {max_long_otm_pct}% above "
+                    f"spot ${spot:.2f} — waiting for a near-the-money strike with good quotes")
+        return None
     target_short = float(lrow["strike"]) + spot * width_pct
     shorts = chain[chain["strike"] > lrow["strike"]]
     if shorts.empty:
@@ -93,6 +103,8 @@ def construct_call_spread(
         return None
     contracts = max(1, int(account_size * risk_pct // (debit * 100)))
     total = round(contracts * debit * 100, 2)
+    tp_value = round(debit + tp_fraction * (width - debit), 2) if tp_fraction > 0 else 0.0
+    max_price = round(round(debit * 1.02 / 0.05) * 0.05, 2)
     return CallSpread(
         expiration=exp, expiration_label=datetime.strptime(exp, "%Y-%m-%d").strftime("%b %-d, %Y"), dte=dte,
         strike=float(lrow["strike"]), short_strike=float(srow["strike"]),
@@ -102,7 +114,19 @@ def construct_call_spread(
         round_trip_cost=round((la - lb) + (sa - sb), 2), contracts=contracts,
         cost_per_contract=round(debit * 100, 2), total_cost=total, account_size=account_size,
         risk_pct_used=round(total / account_size * 100, 1), spy_price=spot,
+        tp_value=tp_value, stop_value=round(debit * (1 + SL_PCT / 100), 2), max_price=max_price,
+        long_mid=round((la + lb) / 2, 2), short_mid=round((sa + sb) / 2, 2),
     )
+
+
+def liquid_calls(calls: pd.DataFrame, min_oi: int = 200, max_spread_pct: float = 0.15) -> pd.DataFrame:
+    """Usable strikes for a spread: real two-sided quotes, decent open interest, tight bid/ask.
+    Deliberately ignores same-day VOLUME — right after the open it is tiny and wrongly hides at-the-money strikes."""
+    if calls is None or calls.empty or not {"bid", "ask", "openInterest"}.issubset(calls.columns):
+        return pd.DataFrame()
+    df = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["openInterest"].fillna(0) >= min_oi)].copy()
+    mid = (df["bid"] + df["ask"]) / 2
+    return df[(df["ask"] - df["bid"]) / mid <= max_spread_pct]
 
 
 def spread_value(ticker: str, expiration: str, long_strike: float, short_strike: float) -> Optional[float]:

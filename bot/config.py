@@ -82,6 +82,9 @@ class BotConfig:
     strategy: str = "single_leg"
     spread_dte_min: int = 50
     spread_dte_max: int = 75
+    tp_fraction: float = 0.60            # close a spread once this share of its MAX profit is reached (0 = no target)
+    entry_earliest: str = "10:00"        # ET; quotes right at the open are stale/thin, so don't enter before this
+    max_long_otm_pct: float = 0.5        # long strike must be within this % above spot (keeps it ~at-the-money)
 
 
 def load_config() -> BotConfig:
@@ -111,6 +114,9 @@ def load_config() -> BotConfig:
         max_position_pct=float(os.getenv("MAX_POSITION_PCT", 100)),
         stale_scan_minutes=int(os.getenv("STALE_SCAN_MINUTES", 60)),
         strategy=os.getenv("STRATEGY", "call_spread_trend").lower(),
+        tp_fraction=float(os.getenv("TP_FRACTION", 0.60)),
+        entry_earliest=os.getenv("ENTRY_EARLIEST_ET", "10:00"),
+        max_long_otm_pct=float(os.getenv("MAX_LONG_OTM_PCT", 0.5)),
         spread_dte_min=int(os.getenv("SPREAD_DTE_MIN", 50)),
         spread_dte_max=int(os.getenv("SPREAD_DTE_MAX", 75)),
     )

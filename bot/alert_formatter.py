@@ -95,43 +95,117 @@ def format_discord_embed(
     }
 
 
+def _code(lines) -> str:
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def _money(x: float) -> str:
+    return f"+${x:,.0f}" if x >= 0 else f"−${abs(x):,.0f}"
+
+
+def progress_bar(frac: float, n: int = 10) -> str:
+    frac = max(0.0, min(1.0, frac))
+    return "▓" * round(frac * n) + "░" * (n - round(frac * n))
+
+
 def format_spread_embed(spread, spot: float, ma200: float, timestamp: str) -> dict:
-    """Entry alert for the trend-gated bull call spread (paper trade)."""
-    from bot.spread_strategy import TP_PCT, SL_PCT
-    today = datetime.now(ET).date()
+    """Entry alert: a copy-ready order ticket, then exactly when to take profit / get out."""
+    from bot.spread_strategy import SL_PCT
     exp = datetime.strptime(spread.expiration, "%Y-%m-%d").date()
     close_by = exp - timedelta(days=CONFIG.expiry_buffer_days)
-    debit = spread.ask_price
+    n, debit = spread.contracts, spread.ask_price
+    max_gain = spread.max_profit_per_share * 100 * n
+    tp_gain = (spread.tp_value - debit) * 100 * n
+    stop_loss = (spread.stop_value - debit) * 100 * n
+
+    ticket = _code([
+        f"{TICKER}  ·  Call Debit Spread  ·  {n} spread{'s' if n > 1 else ''}",
+        f"Expiration:    {spread.expiration_label}",
+        f"BUY  to open:  ${spread.strike:.0f} Call   (long)",
+        f"SELL to open:  ${spread.short_strike:.0f} Call   (short)",
+        f"Order type:    LIMIT  ·  NET DEBIT ${debit:.2f}",
+        f"Don't pay more than ${spread.max_price:.2f}",
+    ])
     description = (
-        f"## OPEN {spread.contracts}× {TICKER} ${spread.strike:.0f} / ${spread.short_strike:.0f} CALL SPREAD\n"
-        f"**Buy** the ${spread.strike:.0f} call  ·  **Sell** the ${spread.short_strike:.0f} call  ·  same expiry\n"
-        f"**Expires:** {spread.expiration_label}  ({spread.dte} days)\n"
-        f"**Net price:** ${debit:.2f} per share  →  **${spread.total_cost:,.0f} total** "
-        f"({spread.risk_pct_used:.1f}% of your ${spread.account_size:,.0f} account)\n"
-        f"**Most you can lose:** ${spread.total_cost:,.0f}  ·  **Most you can make:** "
-        f"${spread.max_profit_per_share * 100 * spread.contracts:,.0f}"
+        f"**1) Place this order** — in Robinhood choose *Call Debit Spread* (tap the box to copy):\n{ticket}\n"
+        f"**Cost:** ${spread.total_cost:,.0f}  ({debit:.2f} × 100"
+        + (f" × {n}" if n > 1 else "") + f")  ·  **Most you can lose:** ${spread.total_cost:,.0f}  ·  "
+        f"**Most you can make:** ${max_gain:,.0f} (if {TICKER} is at or above ${spread.short_strike:.0f} at expiry)"
     )
+
+    if spread.tp_value > 0:
+        profit_text = (
+            f"**Close the whole spread when its price reaches ${spread.tp_value:.2f}** → about **{_money(tp_gain)}**.\n"
+            f"That's the *spread price* Robinhood shows for your position (you paid ${debit:.2f}). "
+            f"It's {int(CONFIG.tp_fraction * 100)}% of the most you can make; in backtests this gave up some profit versus "
+            f"waiting longer, in exchange for a clear exit.")
+    else:
+        profit_text = "No profit target is set — hold until the stop or the last day below."
     fields = [
-        {"name": "🚪 Exit plan", "value": (
-            (f"✅ **Take profit:** close when the spread is worth **${debit * (1 + TP_PCT / 100):.2f}** (+{TP_PCT:.0f}%)\n"
-               if debit * (1 + TP_PCT / 100) < spread.width * 0.90 else
-               f"ℹ️ **No profit target:** this spread can't reach +{TP_PCT:.0f}% (max value ${spread.width:.2f}) — it exits at the stop or 3 days before expiry\n") +
-            f"🛑 **Stop loss:** close if it falls to **${debit * (1 + SL_PCT / 100):.2f}** ({SL_PCT:.0f}%)\n"
-            f"⌛ **Last day to hold:** **{close_by.strftime('%b %-d')}** (time decay speeds up after that)"), "inline": False},
+        {"name": "2) 🎯 When to take profit", "value": profit_text, "inline": False},
+        {"name": "3) 🛑 When to get out", "value": (
+            f"• **Stop:** close if the spread's price falls to **${spread.stop_value:.2f}** → about **{_money(stop_loss)}**\n"
+            f"• **Time:** close on **{close_by.strftime('%b %-d')}** at the latest (decay speeds up near expiry)\n"
+            f"• You'll get a **CLOSE NOW** alert with a copy-ready order when any of these hit."), "inline": False},
+        {"name": "Prices right now", "value": _code([
+            f"Long  ${spread.strike:.0f} call:   bid {spread.long_bid:.2f} / ask {spread.long_ask:.2f}",
+            f"Short ${spread.short_strike:.0f} call:  bid {spread.short_bid:.2f} / ask {spread.short_ask:.2f}",
+            f"{TICKER} ${spot:.2f}   ·   breakeven at expiry ${spread.breakeven:.2f}"]), "inline": False},
         {"name": "📈 Why now", "value": (
-            f"{TICKER} is **above its 200-day average** (${spot:.2f} vs ${ma200:.2f}, {(spot / ma200 - 1) * 100:+.1f}%).\n"
-            f"The rule: hold a bullish spread whenever the trend is up and no trade is open."), "inline": False},
-        {"name": "⚠️ Be realistic", "value": (
-            "This is **market exposure, not a prediction**. In backtests about half of these trades lose, "
-            "and a loss can reach ~70% of the premium. Paper trade only."), "inline": False},
-        {"name": "Details", "value": (
-            f"**Breakeven:** ${spread.breakeven:.2f}  ·  **Spread cost in/out:** ${spread.round_trip_cost:.2f}  ·  "
-            f"**{TICKER}:** ${spot:.2f}"), "inline": False},
+            f"{TICKER} is **above its 200-day average** (${spot:.2f} vs ${ma200:.2f}, {(spot / ma200 - 1) * 100:+.1f}%). "
+            f"The rule: hold a bullish spread whenever the trend is up and no trade is open. "
+            f"This is market exposure, not a prediction — about half of these trades lose. Paper only."), "inline": False},
     ]
     return {"username": f"{TICKER} Options Bot", "embeds": [{
-        "title": f"🟢 {TICKER} BULL CALL SPREAD — trend entry", "description": description,
+        "title": f"🟢 {TICKER} — NEW TRADE: Bull Call Spread", "description": description,
         "color": 0x00C851, "fields": fields,
         "footer": {"text": f"{timestamp} · Paper trade only · Not financial advice"}}]}
+
+
+def format_spread_update(trade: dict, value: float, quote: Optional[dict], spot: float, status: str,
+                         days_left, close_by: str) -> str:
+    """Hourly status for an open spread: says what to do, shows both legs, and how far from the target."""
+    entry, n = trade["entry_price"], trade["contracts"]
+    pnl = (value - entry) * 100 * n
+    pct = (value / entry - 1) * 100
+    tp, stop = trade.get("tp_value"), trade.get("stop_value") or entry * 0.5
+    head = {"hold": "✅ HOLD — nothing to do", "near": "⏳ CLOSE TO TARGET — get your sell order ready",
+            "warn": "⚠️ WATCH — getting close to your stop"}[status]
+    lines = [f"**{head}**",
+             f"**{TICKER} ${trade['strike']:.0f} / ${trade['short_strike']:.0f} Call Debit Spread**  "
+             f"(long ${trade['strike']:.0f} call, short ${trade['short_strike']:.0f} call)",
+             f"Spread price now **${value:.2f}**  (you paid ${entry:.2f})  →  **{_money(pnl)} ({pct:+.0f}%)**"]
+    if tp:
+        prog = (value - entry) / (tp - entry) if tp > entry else 0
+        lines.append(f"Toward profit target: `{progress_bar(prog)}` {max(prog, 0) * 100:.0f}%  "
+                     f"(close at **${tp:.2f}**, stop at **${stop:.2f}**)")
+    else:
+        lines.append(f"Stop at **${stop:.2f}**")
+    if quote:
+        lines.append(_code([f"Long  ${trade['strike']:.0f} call:   {quote['long_bid']:.2f} / {quote['long_ask']:.2f}",
+                            f"Short ${trade['short_strike']:.0f} call:  {quote['short_bid']:.2f} / {quote['short_ask']:.2f}"]))
+    lines.append(f"{TICKER} ${spot:.2f}  ·  expires {trade['expiration']} ({days_left} days)  ·  last day to hold **{close_by}**")
+    return "\n".join(lines)
+
+
+def format_spread_exit(kind: str, trade: dict, value: float, pnl: float, pct: float) -> str:
+    """Sell alert: why, the result, and a copy-ready closing order."""
+    why = {"take_profit": "🎯 **TAKE PROFIT — your target was hit**",
+           "stop_loss": "🛑 **STOP HIT — get out**",
+           "expiry_buffer": f"⌛ **TIME TO CLOSE — under {CONFIG.expiry_buffer_days} days left**",
+           "expiration": "⌛ **EXPIRING — close it now**",
+           "signal_exit": "🔔 **EXIT SIGNAL — close it**"}.get(kind, "🔔 **CLOSE NOW**")
+    n = trade["contracts"]
+    order = _code([
+        f"{TICKER}  ·  Call Debit Spread  ·  CLOSE {n} spread{'s' if n > 1 else ''}",
+        f"Expiration:     {trade['expiration']}",
+        f"SELL to close:  ${trade['strike']:.0f} Call   (your long)",
+        f"BUY  to close:  ${trade['short_strike']:.0f} Call   (your short)",
+        f"Order type:     LIMIT  ·  NET CREDIT ${value:.2f} or better",
+    ])
+    result = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+    return (f"{why}\n**{result}: {_money(pnl)} ({pct:+.0f}%)**  ·  paid ${trade['entry_price']:.2f} → "
+            f"closing near ${value:.2f}\n\n**Place this order** (in Robinhood open your {TICKER} spread → *Close*):\n{order}")
 
 
 def format_whatsapp_message(
